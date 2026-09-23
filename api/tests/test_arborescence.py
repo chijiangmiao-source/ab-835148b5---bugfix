@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import copy
 import itertools
+import json
 import random
 
 import pytest
@@ -113,6 +115,36 @@ UNREACHABLE = (
     ),
 )
 
+# 双零代价环：{a,b} 与 {c,d}，经 e7（b→c）串联，根入口 e5/e6 代价均为 2。
+# 最优树代价 3：e5 打破第一环、e7 从第一环跨入第二环，环上各保留一条零代价边。
+DOUBLE_CYCLE = (
+    ["r", "a", "b", "c", "d"],
+    "r",
+    make(
+        ["r", "a", "b", "c", "d"],
+        "r",
+        [
+            ("e1", "b", "a", 0),
+            ("e2", "a", "b", 0),
+            ("e3", "d", "c", 0),
+            ("e4", "c", "d", 0),
+            ("e5", "r", "a", 2),
+            ("e6", "r", "c", 2),
+            ("e7", "b", "c", 1),
+        ],
+    ),
+)
+
+ACYCLIC_CHAIN = (
+    ["r", "a", "b", "c"],
+    "r",
+    make(
+        ["r", "a", "b", "c"],
+        "r",
+        [("t1", "r", "a", 1), ("t2", "a", "b", 2), ("t3", "b", "c", 3)],
+    ),
+)
+
 
 class TestSamples:
     def test_nested_cycles(self):
@@ -163,6 +195,175 @@ class TestSamples:
         assert res["status"] == "unsolvable"
         assert res["unreachable"] == ["z"]
         assert res["reason"]
+
+
+class TestDoubleCycle:
+    """双零代价环（并列、经跨环通道串联）的完整证据链验收。"""
+
+    def test_tree_and_cost(self):
+        points, root, channels = DOUBLE_CYCLE
+        res = solve(points, root, channels)
+        assert res["status"] == "ok"
+        assert res["total_cost"] == 3
+        assert res["canonical_ids"] == ["e2", "e4", "e5", "e7"]
+        # 逐边合计与总代价一致
+        assert sum(e["cost"] for e in res["tree"]) == 3
+        by_id = {e["id"]: e for e in res["tree"]}
+        assert [(by_id[c]["from"], by_id[c]["to"]) for c in res["canonical_ids"]] == [
+            ("a", "b"), ("c", "d"), ("r", "a"), ("b", "c"),
+        ]
+
+    def test_record_three_levels_two_contractions(self):
+        points, root, channels = DOUBLE_CYCLE
+        rec = solve(points, root, channels)["record"]
+        assert rec["contractions"] == 2
+        assert len(rec["levels"]) == 3
+        assert [lv["depth"] for lv in rec["levels"]] == [0, 1, 2]
+
+        # 第 0 层：四个点全部选零代价入口，a/b 闭成环
+        lv0 = rec["levels"][0]
+        assert {c["channel"] for c in lv0["chosen"]} == {"e1", "e2", "e3", "e4"}
+        cy0 = lv0["cycle"]
+        assert set(cy0["nodes"]) == {"a", "b"}
+        assert set(cy0["channels"]) == {"e1", "e2"}
+        s1 = cy0["supernode"]
+        # 环的入环候选：仅 e5（r→a，代价 2 − 0 = 2）
+        assert {(r["channel"], r["adjusted_cost"], r["enters"])
+                for r in cy0["rewired_in"]} == {("e5", 2, "a")}
+        assert cy0["dropped_internal"] == []
+
+        # 第 1 层：S1 选 e5；c/d 仍闭成零代价环
+        lv1 = rec["levels"][1]
+        assert lv1["nodes"] == sorted({"r", s1, "c", "d"})
+        pick1 = {c["node"]: c["channel"] for c in lv1["chosen"]}
+        assert pick1 == {s1: "e5", "c": "e3", "d": "e4"}
+        cy1 = lv1["cycle"]
+        assert set(cy1["nodes"]) == {"c", "d"}
+        assert set(cy1["channels"]) == {"e3", "e4"}
+        s2 = cy1["supernode"]
+        assert s2 != s1
+        # 入环候选：e6（r→c，修正 2）与 e7（S1→c，修正 1）
+        assert {(r["channel"], r["adjusted_cost"], r["enters"])
+                for r in cy1["rewired_in"]} == {("e6", 2, "c"), ("e7", 1, "c")}
+
+        # 第 2 层（最深）：e5 进入第一个超点，e7 跨入第二个超点，无环
+        lv2 = rec["levels"][2]
+        assert lv2["cycle"] is None
+        assert {c["node"]: c["channel"] for c in lv2["chosen"]} == {
+            s1: "e5", s2: "e7",
+        }
+
+    def test_expansions_inner_first(self):
+        points, root, channels = DOUBLE_CYCLE
+        rec = solve(points, root, channels)["record"]
+        s1 = rec["levels"][0]["cycle"]["supernode"]
+        s2 = rec["levels"][1]["cycle"]["supernode"]
+        exps = rec["expansions"]
+        assert len(exps) == 2
+
+        # 先展开内环 c/d：e7 进入 c，替掉 e3、保留 e4
+        assert exps[0] == {
+            "supernode": s2,
+            "entering_channel": "e7",
+            "enters_node": "c",
+            "removed_cycle_channel": "e3",
+            "kept_cycle_channels": ["e4"],
+        }
+        # 再展开外环 a/b：e5 进入 a，替掉 e1、保留 e2
+        assert exps[1] == {
+            "supernode": s1,
+            "entering_channel": "e5",
+            "enters_node": "a",
+            "removed_cycle_channel": "e1",
+            "kept_cycle_channels": ["e2"],
+        }
+
+    def test_replay_matches_tree(self):
+        points, root, channels = DOUBLE_CYCLE
+        res = solve(points, root, channels)
+        assert replay_record(points, root, channels, res["record"]) == [
+            "e2", "e4", "e5", "e7",
+        ]
+
+    def test_channel_order_invariance(self):
+        points, root, channels = DOUBLE_CYCLE
+        ref = solve(points, root, channels)
+        ref_norm = json.dumps(ref["record"], sort_keys=True, ensure_ascii=False)
+        rng = random.Random(20260923)
+        for _ in range(30):
+            shuffled = channels[:]
+            rng.shuffle(shuffled)
+            got = solve(points, root, shuffled)
+            assert got["canonical_ids"] == ref["canonical_ids"]
+            assert got["total_cost"] == ref["total_cost"]
+            assert json.dumps(got["record"], sort_keys=True, ensure_ascii=False) == ref_norm
+
+    def test_forged_single_level_record_rejected(self):
+        """旧缺陷形态：把最终树伪装成唯一的无环第 0 层，独立复算必须拒绝。"""
+        points, root, channels = DOUBLE_CYCLE
+        forged = {
+            "levels": [
+                {
+                    "depth": 0,
+                    "nodes": sorted(points),
+                    "chosen": [
+                        {"node": "a", "channel": "e5", "cost": 2},
+                        {"node": "b", "channel": "e2", "cost": 0},
+                        {"node": "c", "channel": "e7", "cost": 1},
+                        {"node": "d", "channel": "e4", "cost": 0},
+                    ],
+                    "cycle": None,
+                }
+            ],
+            "expansions": [],
+            "contractions": 0,
+        }
+        with pytest.raises(AssertionError):
+            replay_record(points, root, channels, forged)
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            # 删掉一次收缩（最深层前移并漏报第 1 层的环）
+            lambda r: r["levels"].pop(1),
+            # 抹掉第 0 层的环
+            lambda r: r["levels"][0].__setitem__("cycle", None),
+            # 展开次序颠倒（先外后内）
+            lambda r: r["expansions"].reverse(),
+            # 篡改被替换环边（e7 展开时伪称替掉 e4）
+            lambda r: r["expansions"][0].__setitem__(
+                "removed_cycle_channel", "e4"
+            ),
+            # 篡改修正代价
+            lambda r: r["levels"][1]["cycle"]["rewired_in"][1].__setitem__(
+                "adjusted_cost", 0
+            ),
+            # contractions 计数与层数不符
+            lambda r: r.__setitem__("contractions", 1),
+        ],
+    )
+    def test_tampered_records_rejected(self, mutate):
+        points, root, channels = DOUBLE_CYCLE
+        rec = copy.deepcopy(solve(points, root, channels)["record"])
+        mutate(rec)
+        with pytest.raises(AssertionError):
+            replay_record(points, root, channels, rec)
+
+
+class TestAcyclic:
+    def test_chain_has_zero_contractions_single_level(self):
+        points, root, channels = ACYCLIC_CHAIN
+        res = solve(points, root, channels)
+        assert res["status"] == "ok"
+        assert res["total_cost"] == 6
+        assert res["canonical_ids"] == ["t1", "t2", "t3"]
+        rec = res["record"]
+        assert rec["contractions"] == 0
+        assert len(rec["levels"]) == 1
+        assert rec["levels"][0]["depth"] == 0
+        assert rec["levels"][0]["cycle"] is None
+        assert rec["expansions"] == []
+        assert replay_record(points, root, channels, rec) == ["t1", "t2", "t3"]
 
 
 class TestValidation:

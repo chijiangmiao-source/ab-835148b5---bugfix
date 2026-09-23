@@ -40,15 +40,18 @@ function highlightOf(item, pointSet) {
 }
 
 /** 为每条最终树边汇总其在记录中的证据标签。 */
-function buildEvidence(record) {
+export function buildEvidence(record) {
   const m = new Map();
   const add = (id, kind, text) => {
     if (!m.has(id)) m.set(id, []);
     m.get(id).push({ kind, text });
   };
-  for (const lv of record.levels) {
-    if (lv.depth === 0) {
-      for (const c of lv.chosen) add(c.channel, "pick", "第 0 层最低入口");
+  // 仅最深无环层的逐点选择才是“真正的最低入口”；中间收缩层 chosen 中的边
+  // 要么随后被替换、要么作为环边保留，不能笼统标成“第 0 层最低入口”。
+  const leaf = record.levels[record.levels.length - 1];
+  if (leaf && leaf.cycle === null) {
+    for (const c of leaf.chosen) {
+      add(c.channel, "pick", `第 ${leaf.depth} 层最低入口`);
     }
   }
   for (const e of record.expansions) {

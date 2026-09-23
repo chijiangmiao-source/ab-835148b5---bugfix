@@ -85,6 +85,52 @@ SCENARIOS = {
         "expect_ids": ["e1", "e2", "e4", "e6"],
         "expect_cost": 8,
         "expect_contractions": 2,
+        "expect_level_count": 3,
+        "expect_cycle_nodes": [{"a", "b"}, {"S1", "c"}],
+        "expect_expansions": [
+            {"entering": "e1", "removed": "e5"},
+            {"entering": "e1", "removed": "e3"},
+        ],
+    },
+    "double": {
+        "payload": {
+            "points": ["r", "a", "b", "c", "d"],
+            "root": "r",
+            "channels": [
+                {"id": "e1", "from": "b", "to": "a", "cost": 0},
+                {"id": "e2", "from": "a", "to": "b", "cost": 0},
+                {"id": "e3", "from": "d", "to": "c", "cost": 0},
+                {"id": "e4", "from": "c", "to": "d", "cost": 0},
+                {"id": "e5", "from": "r", "to": "a", "cost": 2},
+                {"id": "e6", "from": "r", "to": "c", "cost": 2},
+                {"id": "e7", "from": "b", "to": "c", "cost": 1},
+            ],
+        },
+        "expect_ids": ["e2", "e4", "e5", "e7"],
+        "expect_cost": 3,
+        "expect_contractions": 2,
+        "expect_level_count": 3,
+        "expect_cycle_nodes": [{"a", "b"}, {"c", "d"}],
+        "expect_expansions": [
+            {"entering": "e7", "removed": "e3", "kept": ["e4"]},
+            {"entering": "e5", "removed": "e1", "kept": ["e2"]},
+        ],
+    },
+    "acyclic": {
+        "payload": {
+            "points": ["r", "a", "b", "c"],
+            "root": "r",
+            "channels": [
+                {"id": "t1", "from": "r", "to": "a", "cost": 1},
+                {"id": "t2", "from": "a", "to": "b", "cost": 2},
+                {"id": "t3", "from": "b", "to": "c", "cost": 3},
+            ],
+        },
+        "expect_ids": ["t1", "t2", "t3"],
+        "expect_cost": 6,
+        "expect_contractions": 0,
+        "expect_level_count": 1,
+        "expect_expansions": [],
     },
     "parallel": {
         "payload": {
@@ -146,17 +192,64 @@ def verify_ok_scenario(name: str, sc: dict) -> None:
           f"总代价 == {sc['expect_cost']}（实际 {body_api['total_cost']}）")
     check(body_api["canonical_ids"] == sc["expect_ids"],
           f"规范树标识序列 == {sc['expect_ids']}（实际 {body_api['canonical_ids']}）")
-    check(body_api["record"]["contractions"] == sc["expect_contractions"],
-          f"环收缩次数 == {sc['expect_contractions']}")
+    rec = body_api["record"]
+    check(rec["contractions"] == sc["expect_contractions"],
+          f"环收缩次数 == {sc['expect_contractions']}（实际 {rec['contractions']}）")
+
+    # 计算层级：深度连续、最深层无环
+    levels = rec["levels"]
+    expect_levels = sc.get("expect_level_count", 1)
+    check(len(levels) == expect_levels,
+          f"计算层级数 == {expect_levels}（实际 {len(levels)}）")
+    check([lv["depth"] for lv in levels] == list(range(len(levels))), "层级深度连续 0..N")
+    check(levels[-1]["cycle"] is None, "最深层无环")
+
+    # 各收缩层的环节点集合，以及两条展开记录与收缩超点一一对应
+    cycle_levels = [lv for lv in levels if lv["cycle"] is not None]
+    got_cycle_sets = [set(lv["cycle"]["nodes"]) for lv in cycle_levels]
+    expect_cycles = sc.get("expect_cycle_nodes", [])
+    check(got_cycle_sets == expect_cycles,
+          f"各环节点集合 == {[set(s) for s in expect_cycles]}（实际 {got_cycle_sets}）")
+    exps = rec["expansions"]
+    check(len(exps) == sc["expect_contractions"], "展开记录数 == 收缩次数")
+    super_pairs = list(zip(
+        [lv["cycle"]["supernode"] for lv in cycle_levels],
+        [e["supernode"] for e in reversed(exps)],
+    ))
+    check(all(a == b for a, b in super_pairs), "每条展开对应一个收缩超点（先内后外）")
+    for i, want in enumerate(sc.get("expect_expansions", [])):
+        got = exps[i]
+        check(got["entering_channel"] == want["entering"]
+              and got["removed_cycle_channel"] == want["removed"],
+              f"展开 {i+1}：{want['entering']} 进入并替换 {want['removed']}"
+              f"（实际 {got['entering_channel']} 替换 {got['removed_cycle_channel']}）")
+        if "kept" in want:
+            check(got["kept_cycle_channels"] == want["kept"],
+                  f"展开 {i+1} 保留环边 == {want['kept']}"
+                  f"（实际 {got['kept_cycle_channels']}）")
+
     replayed = replay_record(
         sc["payload"]["points"], sc["payload"]["root"],
-        channels_of(sc["payload"]), body_api["record"],
+        channels_of(sc["payload"]), rec,
     )
     check(replayed == body_api["canonical_ids"], "收缩/展开记录独立复算得到同一规范树")
     cost_sum = sum(
         c["cost"] for c in body_api["tree"] if c["id"] in set(body_api["canonical_ids"])
     )
     check(cost_sum == body_api["total_cost"], "逐边代价之和等于总代价")
+
+    # 通道录入乱序：规范树与全部证据记录保持不变（页面与 API 同源都核对）
+    shuffled = dict(sc["payload"])
+    shuffled["channels"] = list(reversed(sc["payload"]["channels"]))
+    st_sh, body_sh = http("POST", f"{API}/api/solve", shuffled)
+    st_shw, body_shw = http("POST", f"{WEB}/api/solve", shuffled)
+    check(st_sh == 200 and body_sh.get("status") == "ok", "乱序通道 API 返回 200/ok")
+    check(st_shw == 200 and body_shw == body_api, "乱序通道经页面反代结果与正序完全一致")
+    check(body_sh == body_api, "通道录入顺序调整后总代价、规范树与证据记录均不变")
+    replay_shuffled = replay_record(
+        shuffled["points"], shuffled["root"], channels_of(shuffled), body_sh["record"],
+    )
+    check(replay_shuffled == body_api["canonical_ids"], "乱序记录独立复算仍得同一规范树")
 
 
 def verify_unreachable_scenario() -> None:
@@ -218,7 +311,7 @@ def main() -> int:
         return 1
 
     print("== 真实 API 与页面结果核对 ==")
-    for name in ("nested", "parallel", "canonical"):
+    for name in ("nested", "double", "acyclic", "parallel", "canonical"):
         verify_ok_scenario(name, SCENARIOS[name])
     verify_unreachable_scenario()
     verify_invalid_inputs()

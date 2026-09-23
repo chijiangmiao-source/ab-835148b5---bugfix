@@ -13,6 +13,20 @@ e4, b, c, 1
 e5, c, a, 1
 e6, c, d, 1`,
   },
+  double: {
+    name: "并列双零代价环",
+    points: "r a b c d",
+    root: "r",
+    channels: `# 两个并列零代价环：{a,b} 与 {c,d}，e7（b→c）串联
+# e5/e6 是代价 2 的根入口；最优树总代价 3：e5 破第一环、e7 跨入第二环
+e1, b, a, 0
+e2, a, b, 0
+e3, d, c, 0
+e4, c, d, 0
+e5, r, a, 2
+e6, r, c, 2
+e7, b, c, 1`,
+  },
   parallel: {
     name: "平行通道",
     points: "r x y",
