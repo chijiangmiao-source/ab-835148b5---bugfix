@@ -1,4 +1,4 @@
-/** 内置样例：嵌套环、平行通道、同优规范树、不可达点。 */
+/** 内置样例：嵌套环、双零代价环、平行通道、同优规范树、不可达点。 */
 
 export const SAMPLES = {
   nested: {
@@ -12,6 +12,20 @@ e3, b, a, 1
 e4, b, c, 1
 e5, c, a, 1
 e6, c, d, 1`,
+  },
+  dualring: {
+    name: "双零代价环",
+    points: "r a b c d",
+    root: "r",
+    channels: `# 两个零代价环 {a,b} 与 {c,d}：逐层各收缩一次，
+# 最深层由 e5（r->a）与 e7（b->c）破环；规范树 e2 e4 e5 e7，总代价 3
+e1, b, a, 0
+e2, a, b, 0
+e3, d, c, 0
+e4, c, d, 0
+e5, r, a, 2
+e6, r, c, 2
+e7, b, c, 1`,
   },
   parallel: {
     name: "平行通道",

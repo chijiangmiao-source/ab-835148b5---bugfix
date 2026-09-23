@@ -113,6 +113,26 @@ UNREACHABLE = (
     ),
 )
 
+# 双零代价环：{a,b} 与 {c,d} 各自成环，需两次收缩；
+# 规范树 [e2, e4, e5, e7]，总代价 3。
+DUAL_RING = (
+    ["r", "a", "b", "c", "d"],
+    "r",
+    make(
+        ["r", "a", "b", "c", "d"],
+        "r",
+        [
+            ("e1", "b", "a", 0),
+            ("e2", "a", "b", 0),
+            ("e3", "d", "c", 0),
+            ("e4", "c", "d", 0),
+            ("e5", "r", "a", 2),
+            ("e6", "r", "c", 2),
+            ("e7", "b", "c", 1),
+        ],
+    ),
+)
+
 
 class TestSamples:
     def test_nested_cycles(self):
@@ -163,6 +183,111 @@ class TestSamples:
         assert res["status"] == "unsolvable"
         assert res["unreachable"] == ["z"]
         assert res["reason"]
+
+
+class TestDualRing:
+    """双零代价环场景：两次收缩、三个层级、两次展开，证据链与结果一致。"""
+
+    def test_dual_zero_cost_cycles(self):
+        points, root, channels = DUAL_RING
+        res = solve(points, root, channels)
+        assert res["status"] == "ok"
+        # 规范树与总代价不受记录修复影响
+        assert res["total_cost"] == 3
+        assert res["canonical_ids"] == ["e2", "e4", "e5", "e7"]
+        assert sum(e["cost"] for e in res["tree"]) == 3
+
+        record = res["record"]
+        assert record["contractions"] == 2
+        levels = record["levels"]
+        assert [lv["depth"] for lv in levels] == [0, 1, 2]
+
+        # 第 0 层先显示 a、b 的零代价环
+        cyc0 = levels[0]["cycle"]
+        assert cyc0 is not None
+        assert set(cyc0["nodes"]) == {"a", "b"}
+        assert set(cyc0["channels"]) == {"e1", "e2"}
+        s1 = cyc0["supernode"]
+        # 第 0 层各点最低入口恰为四条零代价环边
+        assert {c["node"]: c["channel"] for c in levels[0]["chosen"]} == {
+            "a": "e1",
+            "b": "e2",
+            "c": "e3",
+            "d": "e4",
+        }
+
+        # 第 1 层再显示 c、d 的零代价环
+        cyc1 = levels[1]["cycle"]
+        assert cyc1 is not None
+        assert set(cyc1["nodes"]) == {"c", "d"}
+        assert set(cyc1["channels"]) == {"e3", "e4"}
+        s2 = cyc1["supernode"]
+        assert s1 != s2
+
+        # 最深层（叶层）无环：e5 进入第一个超点、e7 进入第二个超点
+        leaf = levels[2]
+        assert leaf["cycle"] is None
+        assert {c["node"]: c["channel"] for c in leaf["chosen"]} == {s1: "e5", s2: "e7"}
+
+        # 两次展开与两个收缩超点一一对应，深层先展开
+        exps = record["expansions"]
+        assert len(exps) == 2
+        assert [e["supernode"] for e in exps] == [s2, s1]
+        # 先由 e7 进入 c、替换 e3、保留 e4
+        assert exps[0]["entering_channel"] == "e7"
+        assert exps[0]["enters_node"] == "c"
+        assert exps[0]["removed_cycle_channel"] == "e3"
+        assert exps[0]["kept_cycle_channels"] == ["e4"]
+        # 再由 e5 进入 a、替换 e1、保留 e2
+        assert exps[1]["entering_channel"] == "e5"
+        assert exps[1]["enters_node"] == "a"
+        assert exps[1]["removed_cycle_channel"] == "e1"
+        assert exps[1]["kept_cycle_channels"] == ["e2"]
+
+        # 证据链复算：叶层入选 ∪ 展开保留 = 规范树，逐边合计 = 总代价
+        by_id = {c.id: c for c in channels}
+        evidence_ids = {c["channel"] for c in leaf["chosen"]}
+        evidence_cost = sum(c["cost"] for c in leaf["chosen"])
+        for e in exps:
+            evidence_ids.update(e["kept_cycle_channels"])
+            evidence_cost += sum(by_id[k].cost for k in e["kept_cycle_channels"])
+        assert sorted(evidence_ids) == res["canonical_ids"]
+        assert evidence_cost == res["total_cost"]
+
+        # 独立记录复算得到同一规范树
+        assert replay_record(points, root, channels, record) == res["canonical_ids"]
+
+    def test_channel_order_irrelevant(self):
+        # 调整通道录入顺序，求解结果与可复算记录完全一致
+        points, root, channels = DUAL_RING
+        base = solve(points, root, channels)
+        assert base["status"] == "ok"
+        rng = random.Random(20260923)
+        for _ in range(20):
+            shuffled = list(channels)
+            rng.shuffle(shuffled)
+            assert solve(points, root, shuffled) == base
+        # 逆序亦同
+        assert solve(points, root, list(reversed(channels))) == base
+
+    def test_acyclic_chain_keeps_zero_contractions(self):
+        # 无环链路：单次无环层级、零收缩、无展开
+        points = ["r", "a", "b", "c"]
+        channels = make(
+            points,
+            "r",
+            [("c1", "r", "a", 2), ("c2", "a", "b", 1), ("c3", "b", "c", 3)],
+        )
+        res = solve(points, "r", channels)
+        assert res["status"] == "ok"
+        assert res["total_cost"] == 6
+        assert res["canonical_ids"] == ["c1", "c2", "c3"]
+        record = res["record"]
+        assert record["contractions"] == 0
+        assert record["expansions"] == []
+        assert len(record["levels"]) == 1
+        assert record["levels"][0]["cycle"] is None
+        assert replay_record(points, "r", channels, record) == res["canonical_ids"]
 
 
 class TestValidation:

@@ -32,7 +32,7 @@ export default function TreePanel({ tree, totalCost, evidence, selectedId, onSel
                   <span key={i} className={`badge badge-${tag.kind}`}>{tag.text}</span>
                 ))}
                 {(!evidence.get(e.id) || evidence.get(e.id).length === 0) && (
-                  <span className="muted">第 0 层最低入口</span>
+                  <span className="muted">（记录中无直接证据）</span>
                 )}
               </td>
             </tr>

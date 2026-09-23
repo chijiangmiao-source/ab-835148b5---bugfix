@@ -40,16 +40,17 @@ function highlightOf(item, pointSet) {
 }
 
 /** 为每条最终树边汇总其在记录中的证据标签。 */
-function buildEvidence(record) {
+export function buildEvidence(record) {
   const m = new Map();
   const add = (id, kind, text) => {
     if (!m.has(id)) m.set(id, []);
     m.get(id).push({ kind, text });
   };
-  for (const lv of record.levels) {
-    if (lv.depth === 0) {
-      for (const c of lv.chosen) add(c.channel, "pick", "第 0 层最低入口");
-    }
+  // 最终树边来自：无环叶层（最深层）的最低入口 + 各次展开保留的环边；
+  // 叶层深度随收缩次数变化，不能假定是第 0 层。
+  const leaf = record.levels[record.levels.length - 1];
+  if (leaf) {
+    for (const c of leaf.chosen) add(c.channel, "pick", `第 ${leaf.depth} 层最低入口`);
   }
   for (const e of record.expansions) {
     add(e.entering_channel, "enter", `进入 ${e.supernode}（经 ${e.enters_node}）`);

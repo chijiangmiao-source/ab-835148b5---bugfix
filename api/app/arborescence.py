@@ -186,6 +186,20 @@ def _solve_level(
             return None  # 某点无入边：本层不可解
         in_edge[n] = best
 
+    # 记录本层每个非根点选出的最低入口（代价记原始通道代价，
+    # 使叶层入选与展开保留边的代价合计恰为总代价，便于独立复算核对）。
+    level_rec: dict = {
+        "depth": depth,
+        "nodes": sorted(nodes),
+        "chosen": [
+            {"node": n, "channel": in_edge[n].orig.id, "cost": in_edge[n].orig.cost}
+            for n in sorted(nodes)
+            if n != root
+        ],
+        "cycle": None,
+    }
+    levels.append(level_rec)
+
     cycle = _find_cycle(nodes, root, in_edge)
     if cycle is None:
         return [in_edge[n] for n in sorted(nodes) if n != root]
@@ -194,15 +208,31 @@ def _solve_level(
     used = set(nodes) | {e.orig.id for e in edges}
     sname = _fresh_supernode(sup_counter[0], used)
     cyc = set(cycle)
+    nodes_fwd, channels_fwd = _cycle_forward(cycle, in_edge)
+    cycle_ids = set(channels_fwd)
 
+    rewired_in: list[dict] = []
+    dropped_internal: list[str] = []
     new_edges: list[_Edge] = []
     for e in edges:
         u_in, v_in = e.u in cyc, e.v in cyc
         if u_in and v_in:
+            if e.orig.id not in cycle_ids:
+                dropped_internal.append(e.orig.id)
             continue
         if v_in:
             base = in_edge[e.v].key
             nkey = (e.key[0] - base[0], e.key[1] - base[1], e.key[2])
+            rewired_in.append(
+                {
+                    "channel": e.orig.id,
+                    "from": e.orig.u,
+                    "to": e.orig.v,
+                    "original_cost": e.key[0],
+                    "adjusted_cost": nkey[0],
+                    "enters": e.v,
+                }
+            )
             new_edges.append(_Edge(e.orig, e.u, sname, nkey, enters=e.v, lower=e))
         elif u_in:
             new_edges.append(_Edge(e.orig, sname, e.v, e.key, enters=e.v, lower=e))
@@ -210,6 +240,16 @@ def _solve_level(
             # 未受影响的边也必须包一层，保证每条新层级的边恰有一级 lower
             # 指向本层——否则展开时会越过本层直接解包到外层。
             new_edges.append(_Edge(e.orig, e.u, e.v, e.key, enters=e.v, lower=e))
+
+    # 记录本次环收缩：环节点 / 环边（沿通道方向）、超点、入边代价修正、
+    # 被丢弃的环内非环边。列表均按标识排序，保证与通道录入顺序无关。
+    level_rec["cycle"] = {
+        "supernode": sname,
+        "nodes": nodes_fwd,
+        "channels": channels_fwd,
+        "rewired_in": sorted(rewired_in, key=lambda r: r["channel"]),
+        "dropped_internal": sorted(dropped_internal),
+    }
 
     new_nodes = [n for n in nodes if n not in cyc] + [sname]
     sub = _solve_level(new_nodes, root, new_edges, depth + 1, levels, expansions, sup_counter)
@@ -222,6 +262,19 @@ def _solve_level(
     entering_edge = entering[0]
     kept = [in_edge[v] for v in cycle if v != entering_edge.enters]
 
+    # 记录本次展开替换：进入通道替换掉进入点原有的环边，其余环边保留。
+    expansions.append(
+        {
+            "supernode": sname,
+            "entering_channel": entering_edge.orig.id,
+            "enters_node": entering_edge.enters,
+            "removed_cycle_channel": in_edge[entering_edge.enters].orig.id,
+            "kept_cycle_channels": [
+                in_edge[v].orig.id for v in nodes_fwd if v != entering_edge.enters
+            ],
+        }
+    )
+
     result: list[_Edge] = []
     for e in sub:
         result.append(e.lower if e.lower is not None else e)
@@ -232,29 +285,16 @@ def _solve_level(
 def _edmonds(
     nodes: list[str], root: str, edges: list[_Edge]
 ) -> tuple[list[_Edge], list[dict], list[dict]] | None:
-    """完整 Edmonds 运行；返回 (入选边, 层级记录, 展开记录) 或 None。"""
+    """完整 Edmonds 运行；返回 (入选边, 层级记录, 展开记录) 或 None。
+
+    层级与展开记录由 _solve_level 在收缩 / 展开现场写入：
+    levels 按深度升序（末位为无环叶层），expansions 按展开顺序（深层先展开）。
+    """
     levels: list[dict] = []
     expansions: list[dict] = []
     picked = _solve_level(list(nodes), root, edges, 0, levels, expansions, [0])
     if picked is None:
         return None
-    chosen = []
-    for edge in sorted(picked, key=lambda item: item.orig.v):
-        chosen.append(
-            {
-                "node": edge.orig.v,
-                "channel": edge.orig.id,
-                "cost": edge.orig.cost,
-            }
-        )
-    levels.append(
-        {
-            "depth": 0,
-            "nodes": sorted(nodes),
-            "chosen": chosen,
-            "cycle": None,
-        }
-    )
     return picked, levels, expansions
 
 
@@ -419,13 +459,33 @@ def replay_record(
     """根据收缩 / 展开记录复算最终入选通道标识（升序）。
 
     复算规则：叶子层（无环层）的入选通道 ∪ 每次展开保留的环边。
-    同时校验记录内部一致性：每次展开的进入通道须已在当前选中集内、
-    被替换的环边须属于对应环、最终每非根点恰有一条入边且自根可达。
+    同时校验记录内部一致性：
+      * 层级深度自 0 连续编号，除叶层外每层都带环，叶层无环；
+      * 每层为每个非根点（含超点）恰选一条入边，且通道存在于输入；
+      * 每次展开的进入点属于对应环、被替换的恰是进入该点的环边、
+        保留边与被替换边合起来恰好是整个环；
+      * 每次展开的进入通道须已在当前选中集内；
+      * 每次收缩的超点都被展开且仅展开一次；
+      * 最终每非根点恰有一条入边且自根可达。
     """
     levels: list[dict] = record["levels"]
     expansions: list[dict] = record["expansions"]
     if not levels:
         raise AssertionError("记录缺少层级信息")
+    by_id = {c.id: c for c in channels}
+
+    for want, lv in enumerate(levels):
+        if lv["depth"] != want:
+            raise AssertionError(f"层级深度不连续：第 {want} 层记录为 depth={lv['depth']}")
+        nodes = set(lv["nodes"])
+        chosen_nodes = [c["node"] for c in lv["chosen"]]
+        if set(chosen_nodes) != nodes - {root} or len(chosen_nodes) != len(nodes - {root}):
+            raise AssertionError(f"第 {want} 层入选点集与本层非根点集不一致")
+        for c in lv["chosen"]:
+            if c["channel"] not in by_id:
+                raise AssertionError(f"第 {want} 层选中通道 {c['channel']} 不在输入中")
+        if want < len(levels) - 1 and lv["cycle"] is None:
+            raise AssertionError(f"第 {want} 层无环却不是叶层，记录结构不完整")
     leaf = levels[-1]
     if leaf["cycle"] is not None:
         raise AssertionError("最深层仍含环，记录不完整")
@@ -435,28 +495,49 @@ def replay_record(
     for lv in levels:
         if lv["cycle"]:
             cyc = lv["cycle"]
+            if cyc["supernode"] in cycles_by_super:
+                raise AssertionError(f"超点 {cyc['supernode']} 被重复收缩")
+            if len(cyc["nodes"]) != len(cyc["channels"]):
+                raise AssertionError(f"环 {cyc['supernode']} 的节点数与环边数不一致")
+            for cid in cyc["channels"]:
+                if cid not in by_id:
+                    raise AssertionError(f"环边 {cid} 不在输入中")
             cycles_by_super[cyc["supernode"]] = cyc
 
+    expanded: set[str] = set()
     for exp in expansions:
         if exp["supernode"] not in cycles_by_super:
             raise AssertionError(f"展开记录引用了未知超点 {exp['supernode']}")
+        if exp["supernode"] in expanded:
+            raise AssertionError(f"超点 {exp['supernode']} 被重复展开")
+        expanded.add(exp["supernode"])
         cyc = cycles_by_super[exp["supernode"]]
+        if exp["enters_node"] not in cyc["nodes"]:
+            raise AssertionError(
+                f"展开 {exp['supernode']} 的进入点 {exp['enters_node']} 不属于该环"
+            )
+        # 环边按通道方向排列：进入 nodes[i] 的环边是 channels[i-1]
+        idx = cyc["nodes"].index(exp["enters_node"])
+        want_removed = cyc["channels"][idx - 1]
+        if exp["removed_cycle_channel"] != want_removed:
+            raise AssertionError(
+                f"展开 {exp['supernode']} 应替换进入 {exp['enters_node']} 的环边 "
+                f"{want_removed}，记录为 {exp['removed_cycle_channel']}"
+            )
+        if set(exp["kept_cycle_channels"]) != set(cyc["channels"]) - {want_removed}:
+            raise AssertionError(
+                f"展开 {exp['supernode']} 的保留边与被替换边合起来并非整个环"
+            )
         if exp["entering_channel"] not in selected:
             raise AssertionError(
                 f"展开 {exp['supernode']} 的进入通道 {exp['entering_channel']} 不在当前选中集"
             )
-        if exp["removed_cycle_channel"] not in cyc["channels"]:
-            raise AssertionError(
-                f"展开 {exp['supernode']} 移除的 {exp['removed_cycle_channel']} 不属于该环"
-            )
-        for kept in exp["kept_cycle_channels"]:
-            if kept not in cyc["channels"]:
-                raise AssertionError(
-                    f"展开 {exp['supernode']} 保留的 {kept} 不属于该环"
-                )
-            selected.add(kept)
+        if exp["entering_channel"] not in by_id:
+            raise AssertionError(f"进入通道 {exp['entering_channel']} 不在输入中")
+        selected.update(exp["kept_cycle_channels"])
+    if expanded != set(cycles_by_super):
+        raise AssertionError("存在未展开的收缩超点，记录不完整")
 
-    by_id = {c.id: c for c in channels}
     for cid in selected:
         if cid not in by_id:
             raise AssertionError(f"选中通道 {cid} 不在输入中")
